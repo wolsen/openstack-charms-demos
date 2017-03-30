@@ -6,6 +6,7 @@
 
 import argparse
 import logging
+import re
 import six
 import subprocess
 import time
@@ -28,6 +29,26 @@ log.addHandler(handler)
 JUJU_VERSION = 1
 
 
+class UnknownCharmNameError(Exception):
+    """Raised when the charm name cannot be parsed."""
+    pass
+
+
+def determine_charm_name(properties):
+    if 'charm-name' in properties:
+        return properties['charm-name']
+
+    if 'charm' in properties:
+        match = re.match(r'\w*:(?:\w*/){0,1}(?P<name>\w*)-\d+',
+                         self['charm'])
+        if not match or not match.group('name'):
+            raise UnknownCharmNameError("Unable to parse charm name "
+                                        "from: %s" % self['charm'])
+        return match.group('name')
+    else:
+        raise UnknownCharmNameError("Unable to determine charm name.")
+
+
 class Juju(dict):
 
     def get_service(self, name):
@@ -39,8 +60,13 @@ class Juju(dict):
         if name not in self[key]:
             return None
 
-        svc = Service(self[key][name])
+        service_properties = self[key][name]
+        charm_name = determine_charm_name(service_properties)
+        service_type = SERVICE_TYPES.get(charm_name, Service)
+        svc = service_type(self[key][name])
         svc['name'] = name
+        svc['charm-name'] = charm_name
+
         return svc
 
     @classmethod
@@ -152,9 +178,17 @@ class Juju(dict):
 
 
 class Service(dict):
+
     @property
     def name(self):
         return self['name']
+
+    @property
+    def charm_name(self):
+        if 'charm-name' in self:
+            return self['charm-name']
+        else:
+            return None
 
     def has_relation(self, rel_name):
         return rel_name in self['relations']
@@ -165,13 +199,77 @@ class Service(dict):
     def units(self):
         units = []
         for name, info in self['units'].iteritems():
-            unit = Unit(info)
-            unit['name'] = name
+            unit = self._create_unit(name, info)
             units.append(unit)
         return units
 
+    def _create_unit(self, name, properties):
+        unit = Unit(properties)
+        unit['name'] = name
+        unit['service'] = self
+        return unit
+
     def run(self, command):
         return Juju.run_on_service(self.name, command)
+
+
+class APIService(Service):
+    """A service which provides an API service.
+
+    An API service uses HAProxy to load balance incoming API requests to the
+    backend service and will be drained before pausing the unit in an effort
+    to prevent service disruption.
+    """
+
+    def _create_unit(self, name, properties):
+        unit = APIUnit(properties)
+        unit['name'] = name
+        unit['service'] = self
+        return unit
+
+    def _set_haproxy_backend_state(self, backend_server, state):
+        """Sets the state of the haproxy backend server.
+
+        :param backend_server: the name of the backend server to
+            change the state of
+        :param state: the state to change the backend server to
+        """
+        for u in self.units():
+            backends = u.run("awk '/^backend/ {{ print $2 }}' /etc/haproxy/haproxy.cfg")
+            backends = backends.split('\n')
+
+            commands = []
+            for backend in backends:
+                cmd = ("set server {backend}/{server} "
+                       "state {state}").format(backend=backend,
+                                               server=backend_server,
+                                               state=state)
+                commands.append(cmd)
+                cmd = ';'.join(commands)
+                to_run = ('echo "{cmd}" | sudo nc -U '
+                          '/var/run/haproxy/admin.sock').format(cmd=cmd)
+                log.debug("%s: Issuing command: %s" % (u.name, to_run))
+                try:
+                    u.run(to_run)
+                except subprocess.CalledProcessError as e:
+                    log.error("Failed to set backend %s to state %s on unit "
+                              "%s: %s", backend, state, u.name, e.output)
+
+
+# Defines the Service implementations to use based on the name
+# of the charm. If a service is not listed below, it is given
+# the default Service implementation.
+# Key => Charm Name, Value => Service class
+SERVICE_TYPES = {
+    'nova-cloud-controller': APIService,
+    'keystone': APIService,
+    'glance': APIService,
+    'cinder': APIService,
+    'glance': APIService,
+    'heat': APIService,
+    'neutron-api': APIService,
+    'openstack-dashboard': APIService,
+}
 
 
 class Unit(dict):
@@ -221,20 +319,97 @@ class Unit(dict):
 
         return None
 
+    def pre_pause(self):
+        pass
+
     def pause(self):
         log.info(' Pausing service on unit: %s' % self.name)
         self.run_action('pause')
         log.info(' Service on unit %s is paused.' % self.name)
+
+    def post_pause(self):
+        pass
+
+    def pre_resume(self):
+        pass
 
     def resume(self):
         log.info(' Resuming service on unit: %s' % self.name)
         self.run_action('resume')
         log.info(' Service on unit %s has resumed.' % self.name)
 
+    def post_resume(self):
+        pass
+
     def upgrade_openstack(self):
         log.info(' Upgrading OpenStack for unit: %s' % self.name)
         self.run_action('openstack-upgrade')
         log.info(' Completed upgrade for unit: %s' % self.name)
+
+
+class APIUnit(Unit):
+    """A Unit which provides an API service"""
+
+    has_haproxy_admin_socket = None
+
+    def pre_pause(self):
+        """Runs actions before the pause of the service
+
+        Pausing an API unit will first place the haproxy backend server
+        into a drain state, which will remove the backend server from the
+        load balancing consideration. Next, it will wait the amount of
+        time specified in the draintime parameter to allow the backend
+        server to be able to finish any outstanding requests. After the
+        draintime has elapsed, the haproxy backend server will be placed
+        into maintenance mode. Only once this has completed, the pause
+        action will be invoked on the unit itself.
+        """
+        # Log where the VIP is for informational purposes.
+        log.info('Locating VIP...')
+        output = self.run('sudo crm status | grep IPaddr2')
+        log.info(output.strip())
+
+        if self._is_haproxy_admin_socket_available():
+            self._set_backend_server_state('drain')
+            log.info("Waiting %s seconds for the API requests to complete",
+                     args.draintime)
+            time.sleep(args.draintime)
+            self._set_backend_server_state('maint')
+        else:
+            log.warning("Unable to drain API requests from haproxy queue. "
+                        "API requests may be interrupted.")
+
+    def post_resume(self):
+        """Resumes the unit.
+
+        Resuming an API unit will issue the resume action to the unit itself
+        and then wait for 30 seconds to allow the backend to come up fully.
+        After the 30 seconds have elapsed, the haproxy backends will be set
+        back to the ready state to allow the backend to be a target again.
+        """
+        if self._is_haproxy_admin_socket_available():
+            log.info("Waiting for 30 seconds to allow backend services to "
+                     "initialize...")
+            time.sleep(30)
+            self._set_backend_server_state('ready')
+
+    def _is_haproxy_admin_socket_available(self):
+        if self.has_haproxy_admin_socket is None:
+            try:
+                self.run('echo "help" | '
+                         'sudo nc -U /var/run/haproxy/admin.sock')
+                self.has_haproxy_admin_socket = True
+            except subprocess.CalledProcessError as e:
+                log.debug('Unit %s does not appear to have the haproxy admin '
+                          'socket enabled.', self.name)
+                self.has_haproxy_admin_socket = False
+        return self.has_haproxy_admin_socket
+
+    def _set_backend_server_state(self, state):
+        backend_server = self.name.replace('/', '-')
+        service = self['service']
+        if '_set_backend_server_state' in service:
+            service._set_backend_server_state(backend_server, state)
 
 
 class Status(dict):
@@ -276,18 +451,6 @@ SERVICES = [
     'openstack-dashboard',
 ]
 
-# These services provide API access. These are used to determine
-# if the haproxy backend servers should be drained first before
-# pausing the services. The drain will prevent the service from
-# receiving any new routed API requests.
-API_SERVICES = [
-    'keystone',
-    'glance',
-    'nova-cloud-controller',
-    'neutron-api',
-    'cinder',
-    'openstack-dashboard',
-]
 
 # Not all charms use the openstack-origin. The openstack specific
 # charms do, but some of the others use an alternate origin key
@@ -360,53 +523,6 @@ def order_units(service, units):
     return ordered
 
 
-def _set_haproxy_backend_state(service, unit, state):
-    for u in service.units():
-        backends = u.run("awk '/^backend/ {{ print $2 }}' /etc/haproxy/haproxy.cfg")
-        backends = backends.split('\n')
-        backend_server = unit.name.replace('/', '-')
-
-        commands = []
-        for backend in backends:
-            cmd = ("set server {backend}/{server} "
-                   "state {state}").format(backend=backend, server=backend_server,
-                                           state=state)
-            commands.append(cmd)
-
-        to_run = 'echo "{cmd}" | sudo nc -U /var/run/haproxy/admin.sock'.format(cmd=';'.join(commands))
-        log.debug("%s: Issuing command: %s" % (u.name, to_run))
-        u.run(to_run)
-
-
-def drain(service, unit):
-    """Configures the service to drain the specific unit of API requests.
-
-    Drain mode is a backend server option for the haproxy configuration
-    of any units which provide an API. All backends for the specified
-    unit will be disabled in the service.
-
-    :param service <Service>: the service to drain the backends
-    :param unit <Unit>: the unit to be drained across all units of
-                        the service.
-    :return None:
-    """
-    log.info("Draining the backend services directed at %s", unit.name)
-    _set_haproxy_backend_state(service, unit, 'drain')
-    time.sleep(args.draintime)
-
-
-def ready(service, unit):
-    log.info("Activating the backend services directed at %s", unit.name)
-    time.sleep(30)
-    _set_haproxy_backend_state(service, unit, 'ready')
-
-
-def maint(service, unit):
-    log.info("Moving the backend services on %s into maintenance mode",
-             unit.name)
-    _set_haproxy_backend_state(service, unit, 'maint')
-
-
 def perform_rolling_upgrade(service):
     """Performs a rolling upgrade for the specified service.
 
@@ -437,33 +553,23 @@ def perform_rolling_upgrade(service):
                             'admin actions desired. Press ENTER to proceed.' %
                             unit.name)
 
-        if service.name in API_SERVICES:
-            log.info('Locating VIP...')
-            output = unit.run('sudo crm status | grep IPaddr2')
-            log.info(output.strip())
-
-        do_drain = service.name in API_SERVICES
-        if do_drain:
-            drain(service, unit)
-            maint(service, unit)
-
-        if args.pause and hacluster_unit:
-            hacluster_unit.pause()
-
-        if args.pause and 'pause' in avail_actions:
+        do_pause = args.pause and 'pause' in avail_actions
+        if do_pause:
+            unit.pre_pause()
+            if hacluster_unit:
+                hacluster_unit.pause()
             unit.pause()
+            unit.post_pause()
 
         if 'openstack-upgrade' in avail_actions:
             unit.upgrade_openstack()
 
-        if args.pause and 'resume' in avail_actions:
+        if do_pause:
+            unit.pre_resume()
             unit.resume()
-
-        if args.pause and hacluster_unit:
-            hacluster_unit.resume()
-
-        if do_drain:
-            ready(service, unit)
+            if hacluster_unit:
+                hacluster_unit.resume()
+            unit.post_resume()
 
         log.info(' Unit %s has finished the upgrade.' % unit.name)
 
