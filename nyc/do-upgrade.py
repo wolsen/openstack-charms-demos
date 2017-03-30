@@ -20,6 +20,7 @@ logging.basicConfig(
 
 log = logging.getLogger('os_upgrader')
 handler = logging.StreamHandler()
+handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 handler.setFormatter(formatter)
 log.addHandler(handler)
@@ -143,6 +144,12 @@ class Juju(dict):
         parsed = yaml.safe_load(output)
         return parsed
 
+    @classmethod
+    def run_on_unit(cls, unit, command):
+        cmd = ['juju', 'run', '--unit', unit, command]
+        output = subprocess.check_output(cmd)
+        return output
+
 
 class Service(dict):
     @property
@@ -162,6 +169,9 @@ class Service(dict):
             unit['name'] = name
             units.append(unit)
         return units
+
+    def run(self, command):
+        return Juju.run_on_service(self.name, command)
 
 
 class Unit(dict):
@@ -197,6 +207,9 @@ class Unit(dict):
         except subprocess.CalledProcessError as e:
             log.error(e)
             raise e
+
+    def run(self, command):
+        return Juju.run_on_unit(self.name, command)
 
     def get_hacluster_subordinate_unit(self):
         if not self['subordinates']:
@@ -260,6 +273,19 @@ SERVICES = [
     'cinder',
 
     # Upgrade dashboard
+    'openstack-dashboard',
+]
+
+# These services provide API access. These are used to determine
+# if the haproxy backend servers should be drained first before
+# pausing the services. The drain will prevent the service from
+# receiving any new routed API requests.
+API_SERVICES = [
+    'keystone',
+    'glance',
+    'nova-cloud-controller',
+    'neutron-api',
+    'cinder',
     'openstack-dashboard',
 ]
 
@@ -334,6 +360,53 @@ def order_units(service, units):
     return ordered
 
 
+def _set_haproxy_backend_state(service, unit, state):
+    for u in service.units():
+        backends = u.run("awk '/^backend/ {{ print $2 }}' /etc/haproxy/haproxy.cfg")
+        backends = backends.split('\n')
+        backend_server = unit.name.replace('/', '-')
+
+        commands = []
+        for backend in backends:
+            cmd = ("set server {backend}/{server} "
+                   "state {state}").format(backend=backend, server=backend_server,
+                                           state=state)
+            commands.append(cmd)
+
+        to_run = 'echo "{cmd}" | sudo nc -U /var/run/haproxy/admin.sock'.format(cmd=';'.join(commands))
+        log.debug("%s: Issuing command: %s" % (u.name, to_run))
+        u.run(to_run)
+
+
+def drain(service, unit):
+    """Configures the service to drain the specific unit of API requests.
+
+    Drain mode is a backend server option for the haproxy configuration
+    of any units which provide an API. All backends for the specified
+    unit will be disabled in the service.
+
+    :param service <Service>: the service to drain the backends
+    :param unit <Unit>: the unit to be drained across all units of
+                        the service.
+    :return None:
+    """
+    log.info("Draining the backend services directed at %s", unit.name)
+    _set_haproxy_backend_state(service, unit, 'drain')
+    time.sleep(args.draintime)
+
+
+def ready(service, unit):
+    log.info("Activating the backend services directed at %s", unit.name)
+    time.sleep(30)
+    _set_haproxy_backend_state(service, unit, 'ready')
+
+
+def maint(service, unit):
+    log.info("Moving the backend services on %s into maintenance mode",
+             unit.name)
+    _set_haproxy_backend_state(service, unit, 'maint')
+
+
 def perform_rolling_upgrade(service):
     """Performs a rolling upgrade for the specified service.
 
@@ -364,6 +437,16 @@ def perform_rolling_upgrade(service):
                             'admin actions desired. Press ENTER to proceed.' %
                             unit.name)
 
+        if service.name in API_SERVICES:
+            log.info('Locating VIP...')
+            output = unit.run('sudo crm status | grep IPaddr2')
+            log.info(output.strip())
+
+        do_drain = service.name in API_SERVICES
+        if do_drain:
+            drain(service, unit)
+            maint(service, unit)
+
         if args.pause and hacluster_unit:
             hacluster_unit.pause()
 
@@ -378,6 +461,9 @@ def perform_rolling_upgrade(service):
 
         if args.pause and hacluster_unit:
             hacluster_unit.resume()
+
+        if do_drain:
+            ready(service, unit)
 
         log.info(' Unit %s has finished the upgrade.' % unit.name)
 
@@ -424,6 +510,9 @@ def main():
                         help='Prompt before upgrading nova-compute units to '
                              'allow the compute host to be evacuated prior to '
                              'upgrading the unit.')
+    parser.add_argument('-d', '--draintime', type=int, default=30,
+                        help='Number of seconds to allow for a backend service to '
+                             'drain the API connections. Default is 30 seconds.')
     parser.add_argument('app', metavar='app', type=str, nargs='*',
                         help='target app to upgrade')
     args = parser.parse_args()
